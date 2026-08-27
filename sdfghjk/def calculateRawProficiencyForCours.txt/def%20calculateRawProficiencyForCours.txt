@@ -1,0 +1,540 @@
+def calculateRawProficiencyForAssessment(assessmentId:str,userId:str):
+    configColl = mongoDBClient["skill_intelligence_config"]
+    assessmentColl = mongoDBClient["Assessment"]
+    assessmentReportColl = mongoDBClient["AssessmentReport"]
+    roleColl = mongoDBClient["testingroles"]
+    skillDetailsColl = mongoDBClient["skillDetails"]
+    skillRawProficiencyColl = mongoDBClient["skillRawProficiency"]
+    # proficiencyColl = mongoDBClient["proficiencySkill"]
+    skillColl = mongoDBClient["testingskills"]
+    studentColl = mongoDBClient["globalStudent"]
+    skillNetWorthBreakdownColl = mongoDBClient["skillNetWorthBreakdown"]
+
+    recencyConfig = configColl.find_one({
+    "config_key":"recency_decay"
+})
+
+    verificationConfig = configColl.find_one({
+        "config_key":"verification_tiers"
+    })
+
+    recencyDecay = (
+        recencyConfig.get("config_value",{}).get("min_multiplier",1)
+        if recencyConfig else 1
+    )
+
+    verificationTier = (
+        verificationConfig.get("config_value",{}).get("verified",1)
+        if verificationConfig else 1
+    )
+    assessment = assessmentColl.find_one(
+{
+    "_id":ObjectId(assessmentId)
+},
+{
+    "targetSkills":1,
+    "careerLevel":1,
+    "roleId":1
+}
+)
+    print(assessment, "assessment")
+
+    if not assessment:
+        return
+    role = roleColl.find_one({
+    "_id":ObjectId(assessment["roleId"])
+    })
+
+    if not role:
+        return
+
+    report = assessmentReportColl.find_one(
+    {
+        "skillwalletAssessmentId":assessmentId,
+        "userId":userId
+    },
+    sort=[("percentageEarned",-1)]
+    )
+
+    if not report:
+        return
+    assessmentScore = report.get("percentageEarned", 0) / 100
+    print(assessmentScore, "assessment score")
+    skills = []
+
+    for skill in role.get("primarySkills", []):
+        skills.append(skill["name"])
+
+    for skill in role.get("secondarySkills", []):
+        skills.append(skill["name"])
+
+    for skill in role.get("auxiliarySkills", []):
+        skills.append(skill["name"])
+
+    # Remove duplicates while preserving order
+    skills = list(dict.fromkeys(skills))
+    print(skills, "skills")
+    skillMap = {}
+    existingSkills = {
+            str(doc["skillId"]): doc
+            for doc in skillRawProficiencyColl.find({
+                "userId": ObjectId(userId)
+            })
+        }
+    sourceWeightConfig = configColl.find_one({
+    "config_key": "source_weights"
+    })
+
+    sourceWeights = (
+        sourceWeightConfig.get("config_value", {})
+        if sourceWeightConfig
+        else {}
+    )
+    studentData = studentColl.find_one({"_id":ObjectId(userId)},{"collegeDetails":1})
+    collegeDetails = studentData.get("collegeDetails", [])
+    data = collegeDetails[0].get("sortname", "") if collegeDetails else None
+    for skillName in skills:
+
+        skillDoc = skillDetailsColl.find_one({
+            "userId": ObjectId(userId),
+            "skillName": skillName,
+            "skillLevel": role.get("experience")
+        })
+        testingSkill = skillColl.find_one(
+            {
+                "name": {
+                    "$regex": f"^{re.escape(skillName)}$",
+                    "$options": "i"
+                }
+            },
+            {
+                "category": 1
+            }
+        )
+
+        skillCategory = (
+                testingSkill.get("category")
+                if testingSkill
+                else None
+            )
+
+        if not skillDoc:
+
+            result = skillDetailsColl.insert_one({
+                "skillName": skillName,
+                "skillLevel": role.get("experience"),
+                "selfSkillRating": 0,
+                "version": None,
+                "sortname":data,
+                "createdAt": datetime.utcnow(),
+                "userId": ObjectId(userId),
+                "isverified": True,
+                "category":skillCategory
+            })
+
+            skillMap[skillName] = str(result.inserted_id)
+
+        else:
+            skillDetailsColl.update_one(
+                {
+                    "_id": skillDoc["_id"]
+                },
+                {
+                    "$set": {
+                        "isverified": True,
+                        "updatedAt": datetime.utcnow(),
+                        "sortname":data
+                    }
+                }
+            )
+            skillMap[skillName] = str(skillDoc["_id"])
+    primarySkills = {
+    s["name"] for s in role.get("primarySkills", [])
+    }
+
+    secondarySkills = {
+        s["name"] for s in role.get("secondarySkills", [])
+    }
+
+    auxiliarySkills = {
+        s["name"] for s in role.get("auxiliarySkills", [])
+    }
+    roleCalculationRequired = False
+    assessmentSnetWorth = 0
+    for skill in skills:
+        if skill in primarySkills:
+            depthMultiplier = 1.0
+    
+        elif skill in secondarySkills:
+            depthMultiplier = 0.6
+    
+        elif skill in auxiliarySkills:
+            depthMultiplier = 0.3
+    
+        else:
+            depthMultiplier = 0.3
+        # skillRawProficiencyValue = round(
+        #     100 *
+        #     depthMultiplier)
+        skillRawProficiencyValue = round(
+                    report.get("percentageEarned", 0) *
+                    depthMultiplier)
+        print(skillRawProficiencyValue, "skillrawproficiencyvalue")
+        existing = existingSkills.get(skillMap[skill])
+        if existing:
+
+            details = existing.get(
+                "skillRawProficiency",
+                []
+            )
+
+            updated = False
+
+            for item in details:
+
+                if (
+                    item["type"] == "assessment"
+                    and item["moduleId"] == assessmentId
+                ):
+
+                    item["skillRawProficiencyValue"] = skillRawProficiencyValue
+                    updated = True
+                    break
+
+            if not updated:
+
+                details.append({
+
+                    "type": "assessment",
+
+                    "moduleId": assessmentId,
+
+                    "skillRawProficiencyValue": skillRawProficiencyValue
+
+                })
+
+            typeWise = []
+
+            bestValues = {}
+
+            for item in details:
+
+                moduleType = item["type"]
+
+                current = bestValues.get(moduleType)
+
+                if (
+                    current is None
+                    or item["skillRawProficiencyValue"] > current
+                ):
+                    bestValues[moduleType] = item["skillRawProficiencyValue"]
+
+            for moduleType, value in bestValues.items():
+
+                typeWise.append({
+
+                    "type": moduleType,
+
+                    "skillRawProficiency": value,
+
+                    "updatedAt": datetime.utcnow()
+
+                })
+
+            skillRawProficiencyColl.update_one(
+
+                {
+                    "_id": existing["_id"]
+                },
+
+                {
+                    "$set": {
+
+                        "skillRawProficiency": details,
+
+                        "skillRawProficiencyTypeWise": typeWise
+
+                    }
+                }
+
+            )
+
+            existing["skillRawProficiency"] = details
+            existing["skillRawProficiencyTypeWise"] = typeWise
+        else:
+
+            newDocument = {
+
+                "userId": ObjectId(userId),
+
+                "skillId": ObjectId(skillMap[skill]),
+
+                "skillRawProficiency": [
+
+                    {
+
+                        "type": "assessment",
+
+                        "moduleId": assessmentId,
+                        "updatedAt":datetime.utcnow(),
+
+                        "skillRawProficiencyValue": skillRawProficiencyValue
+
+                    }
+
+                ],
+
+                "skillRawProficiencyTypeWise": [
+                    {
+                        "type": "assessment",
+                        "skillRawProficiency": skillRawProficiencyValue,
+                        "updatedAt": datetime.utcnow()
+                    }
+                ]
+            }
+
+            result = skillRawProficiencyColl.insert_one(
+                newDocument
+            )
+
+            newDocument["_id"] = result.inserted_id
+
+            existingSkills[skillMap[skill]] = newDocument
+
+        skillId = ObjectId(skillMap[skill])
+
+        skillDoc = existingSkills.get(
+            skillMap[skill]
+        )
+
+        if not skillDoc:
+            continue
+
+        skillProficiency = 0
+
+        for item in skillDoc.get(
+            "skillRawProficiencyTypeWise",
+            []
+        ):
+
+            sourceType = item.get("type")
+
+            srp = item.get(
+                "skillRawProficiency",
+                0
+            )
+
+            sourceWeight = sourceWeights.get(
+                sourceType.lower(),
+                0
+            )
+
+            skillProficiency += (
+
+                srp
+                * sourceWeight
+                * recencyDecay
+
+            )
+
+        skillProficiency = min(
+
+            100,
+
+            round(
+
+                skillProficiency
+                * verificationTier
+
+            )
+
+        )
+        skillInfo = skillColl.find_one(
+            {
+                "name": {
+                    "$regex": f"^{re.escape(skill)}$",
+                    "$options": "i"
+                }
+            },
+            {
+                "demand_score": 1
+            }
+        )
+        print(skillId, "skillId")
+
+        demandScore = 1.0
+
+        if skillInfo:
+            demandScore = skillInfo.get("demand_score", 1.0)
+        print(demandScore, "demandScoressssss")
+
+        skillNetWorth = round(
+            skillProficiency * demandScore,
+            2
+        )
+        existingSkill = skillDetailsColl.find_one(
+            {
+                "userId": ObjectId(userId),
+                "skill": skill,
+                "skillLevel":role.get('experience')
+            },
+            {
+                "skillNetWorth": 1,
+                "skillProficiency": 1
+            }
+        )
+        
+
+        print(existingSkill, "existingSkilllllllllllllllllllllllllllll")
+        oldSkillNetWorth = (
+        existingSkill.get("skillNetWorth", 0)
+        if existingSkill
+        else 0
+    )
+        oldSkillProficiency = 0
+        if existingSkill:
+            oldSkillProficiency = existingSkill.get("skillProficiency", 0)
+        assessmentSnetWorthIncrement = max(
+        0,
+        skillNetWorth - oldSkillNetWorth
+    )
+
+        assessmentSnetWorth += assessmentSnetWorthIncrement
+        if (
+            existingSkill is None or
+            skillNetWorth > existingSkill.get("skillNetWorth", 0)
+        ):
+            skillDetailsColl.update_one(
+            {
+                "userId": ObjectId(userId),
+                    "skill": skill,
+                    "skillLevel":role.get('experience')
+            },
+            {
+                "$set": {
+                    "skillProficiency": skillProficiency,
+                    "skillNetWorth": skillNetWorth,
+                    "updatedAt": datetime.utcnow()
+                }
+            }
+        )
+            if oldSkillProficiency != skillProficiency:
+                roleCalculationRequired = True
+                print(oldSkillProficiency,skillProficiency,"skillProficiencyskillProficiency")
+    print(roleCalculationRequired,"roleCalculationRequiredroleCalculationRequired")
+    if roleCalculationRequired:
+        calculateRoleSNetWorth(userId, skillDetailsColl, skillColl)
+        calculateRoleReadiness(userId,roleColl,skillDetailsColl,data)
+        allSkills = list(
+            skillDetailsColl.find(
+                {
+                    "userId": ObjectId(userId)
+                },
+                {
+                    "skillNetWorth": 1
+                }
+            )
+        )
+
+        overallNetWorth = round(
+            sum(
+                skill.get("skillNetWorth", 0)
+                for skill in allSkills
+            ),
+            2
+        )
+        assessmentSnetWorth = round(
+            assessmentSnetWorth,
+            2
+        )
+
+        breakdownDoc = skillNetWorthBreakdownColl.find_one(
+            {
+                "userId": ObjectId(userId)
+            }
+        )
+
+        if breakdownDoc:
+
+            snetWorthArray = breakdownDoc.get(
+                "SnetWorth",
+                []
+            )
+
+            assessmentFound = False
+
+            for item in snetWorthArray:
+
+                # IMPORTANT:
+                # Find only by moduleId.
+                # Do NOT use type in this condition.
+                if item.get("moduleId") == assessmentId:
+
+                    item["snetWorth"] = round(
+                        item.get("snetWorth", 0)
+                        + assessmentSnetWorth,
+                        2
+                    )
+
+                    # Keep/update the correct type
+                    item["type"] = "assessment"
+
+                    assessmentFound = True
+                    break
+
+            if not assessmentFound:
+
+                snetWorthArray.append({
+                    "moduleId": assessmentId,
+                    "snetWorth": assessmentSnetWorth,
+                    "type": "assessment"
+                })
+
+            skillNetWorthBreakdownColl.update_one(
+                {
+                    "_id": breakdownDoc["_id"]
+                },
+                {
+                    "$set": {
+                        "snetWorth": overallNetWorth,
+                        "SnetWorth": snetWorthArray,
+                        "updatedAt": datetime.utcnow()
+                    }
+                }
+            )
+
+        else:
+
+            skillNetWorthBreakdownColl.insert_one({
+                "userId": ObjectId(userId),
+                "snetWorth": overallNetWorth,
+                "SnetWorth": [
+                    {
+                        "moduleId": assessmentId,
+                        "snetWorth": assessmentSnetWorth,
+                        "type": "assessment"
+                    }
+                ],
+                "createdAt": datetime.utcnow(),
+                "updatedAt": datetime.utcnow()
+            })
+        studentColl.update_one(
+                {
+                    "_id": ObjectId(userId)
+                },
+                {
+                    "$set": {
+                        "snetWorth": overallNetWorth,
+                        "updatedAt": datetime.utcnow()
+                    }
+                }
+            )
+        print(skillProficiency, "jdsnkjdb")
+    return {
+    "assessmentId": assessmentId,
+    "userId": userId,
+    "assessmentScore": assessmentScore,
+    "recencyDecay": recencyDecay,
+    "verificationTier": verificationTier,
+    "status": "Assessment skill raw proficiency calculated successfully"
+}
