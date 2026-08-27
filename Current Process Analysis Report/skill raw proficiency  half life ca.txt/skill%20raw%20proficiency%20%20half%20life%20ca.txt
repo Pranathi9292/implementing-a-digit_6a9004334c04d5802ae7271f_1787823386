@@ -1,0 +1,4 @@
+skill raw proficiency : half life calculation ?
+student side maping issue - on student side if we remove existing skills dropdown how to do mapping for the existing skills ? 
+how to calculate role snetworth -- db wise we need to loop many times like if students have 50 skills we have around 71000 roles like we need to loop around 71000 * 50
+
